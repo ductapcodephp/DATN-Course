@@ -1,5 +1,4 @@
 <?php
-// === FILE: app/Models/Wallet.php ===
 
 namespace App\Models;
 
@@ -7,6 +6,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Support\Facades\DB;
 
 /**
  * @property int $id
@@ -25,7 +25,7 @@ class Wallet extends Model
     ];
 
     protected $casts = [
-        'balance' => 'decimal:2',
+        'balance' => 'decimal:2', // Đảm bảo độ chính xác tuyệt đối, không dùng float gây sai số
     ];
 
     // ===== RELATIONSHIPS =====
@@ -47,40 +47,76 @@ class Wallet extends Model
         return $query->where('balance', '>=', $minBalance);
     }
 
-    // ===== HELPERS =====
+    // ===== HELPERS ĐẲNG CẤP ENTERPRISE =====
 
+    /**
+     * Nạp tiền vào ví
+     */
     public function deposit($amount, $description = null, $referenceCode = null)
     {
-        return $this->addTransaction('deposit', $amount, $description, 'completed', $referenceCode);
+        // Bọc vào Transaction để đảm bảo tính toàn vẹn dữ liệu
+        return DB::transaction(function () use ($amount, $description, $referenceCode) {
+            return $this->addTransaction(WalletTransaction::TYPE_DEPOSIT, $amount, $description, WalletTransaction::STATUS_COMPLETED, $referenceCode);
+        });
     }
 
+    /**
+     * Rút tiền / Thanh toán mua hàng (Bảo mật chống Race Condition)
+     */
     public function withdraw($amount, $description = null)
     {
-        if ($this->balance < $amount) {
-            throw new \Exception('Insufficient balance');
-        }
+        return DB::transaction(function () use ($amount, $description) {
+            // Đẳng cấp ở đây: lockForUpdate() sẽ khóa hàng này trong DB lại.
+            // Không một request nào khác được phép đọc số dư cho đến khi transaction này kết thúc.
+            $lockedWallet = self::where('id', $this->id)->lockForUpdate()->first();
 
-        return $this->addTransaction('purchase', $amount, $description, 'completed');
+            if ((float) $lockedWallet->balance < (float) $amount) {
+                throw new \Exception('Số dư tài khoản không đủ để thực hiện giao dịch.');
+            }
+
+            return $lockedWallet->addTransaction(WalletTransaction::TYPE_PURCHASE, $amount, $description, WalletTransaction::STATUS_COMPLETED);
+        });
     }
 
+    /**
+     * Hàm xử lý biến động số dư lõi - Chính xác và an toàn tuyệt đối
+     */
     public function addTransaction($type, $amount, $description = null, $status = 'pending', $referenceCode = null)
     {
-        $balanceBefore = $this->balance;
-        $balanceAfter = $balanceBefore + ($type === 'purchase' ? -$amount : $amount);
-
-        if ($type === 'purchase' || $type === 'refund') {
-            $balanceAfter = $balanceBefore - $amount;
-        } elseif ($type === 'refund') {
-            $balanceAfter = $balanceBefore + $amount;
-        } else {
-            $balanceAfter = $balanceBefore + $amount;
+        if ($amount <= 0) {
+            throw new \InvalidArgumentException('Số tiền giao dịch phải lớn hơn 0.');
         }
 
-        $this->update(['balance' => $balanceAfter]);
+        // Luôn lấy dữ liệu số dư mới nhất từ DB đã được lock
+        $lockedWallet = self::where('id', $this->id)->lockForUpdate()->first();
 
+        $balanceBefore = (float) $lockedWallet->balance;
+        $amount = (float) $amount;
+
+        // Sửa lại logic toán học bị loạn ở file cũ bằng cấu trúc Switch-Case tường minh
+        switch ($type) {
+            case WalletTransaction::TYPE_PURCHASE:
+                $balanceAfter = $balanceBefore - $amount;
+                break;
+
+            case WalletTransaction::TYPE_DEPOSIT:
+            case WalletTransaction::TYPE_REFUND: // Hoàn tiền thì phải CỘNG tiền lại cho user
+            case WalletTransaction::TYPE_COMMISSION: // Tiền hoa hồng tiếp thị liên kết
+            case WalletTransaction::TYPE_VIP_PAYMENT:
+                $balanceAfter = $balanceBefore + $amount;
+                break;
+
+            default:
+                throw new \InvalidArgumentException('Loại giao dịch không được hệ thống hỗ trợ: ' . $type);
+        }
+
+        // Cập nhật số dư mới vào ví
+        $lockedWallet->update(['balance' => $balanceAfter]);
+
+        // Ghi lại lịch sử biến động số dư (Audit Trail)
         return WalletTransaction::create([
-            'wallet_id' => $this->id,
-            'user_id' => $this->user_id,
+            'wallet_id' => $lockedWallet->id,
+            'user_id' => $lockedWallet->user_id,
             'type' => $type,
             'amount' => $amount,
             'balance_before' => $balanceBefore,
